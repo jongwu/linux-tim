@@ -265,6 +265,10 @@ static inline const struct cpumask *cpu_node_mask(int cpu)
 	return cpumask_of_node(cpu_to_node(cpu));
 }
 
+#define NR_LLCS NR_CPUS
+int llc_to_node(int llc);
+int llc_distance(int llc0, int llc1);
+
 #ifdef CONFIG_NUMA
 int sched_numa_find_nth_cpu(const struct cpumask *cpus, int cpu, int node);
 extern const struct cpumask *sched_numa_hop_mask(unsigned int node, unsigned int hops);

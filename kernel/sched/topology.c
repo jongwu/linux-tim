@@ -675,6 +675,8 @@ DEFINE_PER_CPU(struct sched_domain __rcu *, sd_asym_cpucapacity);
 DEFINE_STATIC_KEY_FALSE(sched_asym_cpucapacity);
 DEFINE_STATIC_KEY_FALSE(sched_cluster_active);
 
+static int llc_to_node_map[NR_LLCS] = { [0 ... NR_LLCS-1] = -1 };
+
 static void update_top_cache_domain(int cpu)
 {
 	struct sched_domain_shared *sds = NULL;
@@ -811,6 +813,31 @@ DEFINE_STATIC_KEY_FALSE(sched_cache_active);
 /* user wants cache aware scheduling [0 or 1] */
 int sysctl_sched_cache_user = 1;
 
+/* Return the NUMA node containing the llc */
+int llc_to_node(int llc)
+{
+	if (llc < 0)
+		return -1;
+
+	if (llc >= NR_LLCS)
+		return -1;
+
+	return llc_to_node_map[llc];
+}
+
+/* Return the NUMA distance between the node containing LLC1 and the node containing LLC2 */
+int llc_distance(int llc1, int llc2)
+{
+	int numa1, numa2;
+
+	numa1 = llc_to_node(llc1);
+	numa2 = llc_to_node(llc2);
+	if (numa1 < 0 || numa2 < 0)
+		return -1;
+
+	return node_distance(numa1, numa2);
+}
+
 static bool alloc_sd_pref(const struct cpumask *cpu_map,
 			  struct s_data *d)
 {
@@ -902,6 +929,9 @@ static bool alloc_sd_pref(const struct cpumask *cpu_map,
 {
 	return false;
 }
+
+int llc_to_node(int llc) { return -1; }
+int llc_distance(int llc1, int llc2) { return -1; }
 #endif
 
 /*
@@ -2709,6 +2739,7 @@ build_sched_domains(const struct cpumask *cpu_map, struct sched_domain_attr *att
 		}
 
 		lid = per_cpu(sd_llc_id, i);
+		llc_to_node_map[tl_max_llcs] = cpu_to_node(i);
 		if (lid == -1) {
 			int j;
 
