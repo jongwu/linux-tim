@@ -10061,6 +10061,7 @@ static __maybe_unused bool get_llc_stats(int cpu, unsigned long *util,
 	return true;
 }
 
+
 /*
  * Decision matrix according to the LLC utilization. To
  * decide whether we can do task aggregation across LLC.
@@ -10160,6 +10161,106 @@ static enum llc_mig can_migrate_llc(int src_cpu, int dst_cpu,
 			return mig_forbid;
 	}
 	return mig_llc;
+}
+
+/*
+ * Like get_llc_stats but for sched domain that above LLC level.
+ * Based on get_llc_stats, we can accumulate utility and cap for
+ * sched domain in the granularity of LLC.
+ */
+static bool get_sd_stats(struct sched_domain *sd, unsigned long *util_out, unsigned long *cap_out)
+{
+	struct cpumask mask;
+	int cpu;
+	unsigned long util_tmp, cap_tmp, util = 0, cap = 0;
+	struct sched_domain *sd_tmp;
+
+	if (!sd || !util_out || !cap_out)
+		return false;
+
+	cpumask_copy(&mask, sched_domain_span(sd));
+	for_each_cpu(cpu, &mask) {
+		if (!get_llc_stats(cpu, &util_tmp, &cap_tmp))
+			return false;
+
+		sd_tmp = rcu_dereference(per_cpu(sd_llc, cpu));
+		cpumask_andnot(&mask, &mask, sched_domain_span(sd_tmp));
+		util += util_tmp;
+		cap += cap_tmp;
+	}
+
+	*util_out = util;
+	*cap_out = cap;
+
+	return true;
+}
+
+/* Decide if a sched domain is overload. */
+static bool is_domain_overload(struct sched_domain *sd)
+{
+	int ret;
+	unsigned long util = 0, cap = 0;
+
+	get_sd_stats(sd, &util, &cap);
+
+	/* We are not a llc. Need change name? */
+	ret = !fits_llc_capacity(util, cap);
+
+	return ret;
+}
+
+/*
+ * Decide if migration should happen on a specific node.
+ * The node here is a generic conception for a set of cpu.
+ * It Usually indecates one of sched domain for LLC level and above.
+ */
+static enum llc_mig can_migrate_node(int src_cpu, int dst_cpu, struct task_struct *p, bool to_pref)
+{
+	struct sched_domain *domain;
+	unsigned long dst_util, dst_cap, tsk_util = 0;
+	int k = 0;
+
+	if (!get_llc_stats(dst_cpu, &dst_util, &dst_cap))
+		return mig_unrestricted;
+
+	if (p)
+		tsk_util = task_util(p);
+
+	dst_util = dst_util + tsk_util;
+
+	if (to_pref) {
+		if (fits_llc_capacity(dst_util, dst_cap))
+			return mig_llc;
+		else
+			return mig_unrestricted;
+	}
+
+	/*
+	 * If the dest node decrase locality, decide if it should migrate by testing that
+	 * if it is the closest place that is not overload.
+	 */
+	for_each_domain(src_cpu, domain) {
+		/* Skip sched domain lower than MC */
+		if (domain->flags & SD_SHARE_LLC)
+			continue;
+
+		/* Allow migration if we found dest cpu in this sched domain */
+		if (cpumask_test_cpu(dst_cpu, sched_domain_span(domain)))
+			return mig_llc;
+
+		/*
+		 * For the special case: the workload is small and the dest cpu may far away
+		 * from src cpu.
+		 */
+		if (p && (domain->span_weight > get_nr_threads(p) && k++))
+			return mig_unrestricted;
+
+		/* Don't migrate if there is a better place to live */
+		if (!is_domain_overload(domain))
+			return mig_forbid;
+	}
+
+	return mig_unrestricted;
 }
 
 /*
