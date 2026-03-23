@@ -1599,8 +1599,9 @@ static void task_cache_work(struct callback_head *work)
 	struct task_struct *p = current, *cur;
 	struct mm_struct *mm = p->mm;
 	unsigned long m_a_occ = 0;
-	unsigned long curr_m_a_occ = 0;
-	int cpu, m_a_cpu = -1, nr_running = 0, curr_cpu;
+	unsigned long m_a_n_occ = 0;
+	unsigned long curr_m_a_n_occ = 0;
+	int cpu, m_a_cpu = -1, m_a_n_cpu = -1, nr_running = 0, curr_cpu;
 	cpumask_var_t cpus;
 
 	WARN_ON_ONCE(work != &p->cache_work);
@@ -1626,30 +1627,44 @@ static void task_cache_work(struct callback_head *work)
 		cpumask_copy(cpus, cpu_online_mask);
 
 		for_each_cpu(cpu, cpus) {
-			/* XXX sched_cluster_active */
-			struct sched_domain *sd = per_cpu(sd_llc, cpu);
-			unsigned long occ, m_occ = 0, a_occ = 0;
-			int m_cpu = -1, i;
+			struct sched_domain *nsd = per_cpu(sd_node, cpu);
+			unsigned long occ, m_occ = 0, a_occ = 0, a_n_occ = 0;
+			int m_cpu = -1, i, k;
 
-			if (!sd)
+			if (!nsd)
 				continue;
 
-			for_each_cpu(i, sched_domain_span(sd)) {
-				occ = fraction_mm_sched(cpu_rq(i),
-							per_cpu_ptr(mm->sc_stat.pcpu_sched, i));
-				a_occ += occ;
-				if (occ > m_occ) {
-					m_occ = occ;
-					m_cpu = i;
-				}
-				scoped_guard (rcu) {
-					cur = rcu_dereference(cpu_rq(i)->curr);
-					if (cur && !(cur->flags & (PF_EXITING | PF_KTHREAD)) &&
-					    cur->mm == mm)
-						nr_running++;
-				}
-			}
+			for_each_cpu_and(k, sched_domain_span(nsd), cpus) {
+				a_occ = m_a_occ = m_occ = 0;
+				struct sched_domain *sd = per_cpu(sd_llc, k);
 
+				if (!sd)
+					continue;
+
+				for_each_cpu(i, sched_domain_span(sd)) {
+					occ = fraction_mm_sched(cpu_rq(i),
+						per_cpu_ptr(mm->sc_stat.pcpu_sched, i));
+					a_occ += occ;
+					if (occ > m_occ) {
+						m_occ = occ;
+						m_cpu = i;
+					}
+					scoped_guard (rcu) {
+						cur = rcu_dereference(cpu_rq(i)->curr);
+						if (cur && !(cur->flags & (PF_EXITING |
+							PF_KTHREAD)) && cur->mm == mm)
+							nr_running++;
+					}
+				}
+
+				cpumask_andnot(cpus, cpus, sched_domain_span(sd));
+				if (a_occ > m_a_occ) {
+					m_a_occ = a_occ;
+					m_a_cpu = m_cpu;
+				}
+				/* record for numa node */
+				a_n_occ += a_occ;
+			}
 			/*
 			 * Compare the accumulated occupancy of each LLC. The
 			 * reason for using accumulated occupancy rather than average
@@ -1665,19 +1680,18 @@ static void task_cache_work(struct callback_head *work)
 			 * the average number of faults per CPU. This strategy is also
 			 * followed here.
 			 */
-			if (a_occ > m_a_occ) {
-				m_a_occ = a_occ;
-				m_a_cpu = m_cpu;
+			if (a_n_occ > m_a_n_occ) {
+				m_a_n_occ = a_n_occ;
+				m_a_n_cpu = m_a_cpu;
 			}
 
-			if (llc_id(cpu) == llc_id(mm->sc_stat.cpu))
-				curr_m_a_occ = a_occ;
-
-			cpumask_andnot(cpus, cpus, sched_domain_span(sd));
+			if (mm->sc_stat.cpu != -1 && cpu_to_node(cpu) ==
+					cpu_to_node(mm->sc_stat.cpu))
+				curr_m_a_n_occ = a_n_occ;
 		}
 	}
 
-	if (m_a_occ > (2 * curr_m_a_occ)) {
+	if (m_a_n_occ > (2 * curr_m_a_n_occ)) {
 		/*
 		 * Avoid switching sc_stat.cpu too fast.
 		 * The reason to choose 2X is because:
@@ -1688,7 +1702,7 @@ static void task_cache_work(struct callback_head *work)
 		 * 3. 2X is chosen based on test results, as it delivers
 		 *    the optimal performance gain so far.
 		 */
-		mm->sc_stat.cpu = m_a_cpu;
+		mm->sc_stat.cpu = m_a_n_cpu;
 	}
 
 	update_avg_scale(&mm->sc_stat.nr_running_avg, nr_running);
