@@ -668,6 +668,7 @@ DEFINE_PER_CPU(int, sd_llc_size);
 DEFINE_PER_CPU(int, sd_llc_id) = -1;
 DEFINE_PER_CPU(int, sd_share_id);
 DEFINE_PER_CPU(struct sched_domain_shared __rcu *, sd_llc_shared);
+DEFINE_PER_CPU(struct sched_domain __rcu *, sd_node);
 DEFINE_PER_CPU(struct sched_domain __rcu *, sd_numa);
 DEFINE_PER_CPU(struct sched_domain __rcu *, sd_asym_packing);
 DEFINE_PER_CPU(struct sched_domain __rcu *, sd_asym_cpucapacity);
@@ -676,6 +677,19 @@ DEFINE_STATIC_KEY_FALSE(sched_asym_cpucapacity);
 DEFINE_STATIC_KEY_FALSE(sched_cluster_active);
 
 static int llc_to_node_map[NR_LLCS] = { [0 ... NR_LLCS-1] = -1 };
+
+/* Get sched domain by its name */
+static struct sched_domain *get_sched_domain_by_name(int cpu, char *name)
+{
+	struct sched_domain *sd = NULL;
+
+	for_each_domain(cpu, sd) {
+		if (!strcmp(sd->name, name))
+			break;
+	}
+
+	return sd;
+}
 
 static void update_top_cache_domain(int cpu)
 {
@@ -705,6 +719,9 @@ static void update_top_cache_domain(int cpu)
 	 * but equals to LLC id on non-Cluster machines.
 	 */
 	per_cpu(sd_share_id, cpu) = id;
+
+	sd = get_sched_domain_by_name(cpu, "NODE");
+	rcu_assign_pointer(per_cpu(sd_node, cpu), sd);
 
 	sd = lowest_flag_domain(cpu, SD_NUMA);
 	rcu_assign_pointer(per_cpu(sd_numa, cpu), sd);
