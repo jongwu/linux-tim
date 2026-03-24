@@ -10263,6 +10263,30 @@ static enum llc_mig can_migrate_node(int src_cpu, int dst_cpu, struct task_struc
 	return mig_unrestricted;
 }
 
+int llc_distance(int, int);
+
+/* Decide if the migration improve the affinity */
+static bool if_to_prefer(int src_cpu, int dst_cpu, int pref_llc)
+{
+	int src_dist, dst_dist, to_pref = false;
+
+	src_dist = llc_distance(llc_id(src_cpu), pref_llc);
+	dst_dist = llc_distance(llc_id(dst_cpu), pref_llc);
+
+	if (src_dist > dst_dist) {
+		to_pref = true;
+	} else if (src_dist == dst_dist) {
+		if (llc_id(dst_cpu) == pref_llc)
+			to_pref = true;
+		else
+			to_pref = false;
+	} else {
+		to_pref = false;
+	}
+
+	return to_pref;
+}
+
 /*
  * Check if task p can migrate from source LLC to
  * destination LLC in terms of cache aware load balance.
@@ -10293,15 +10317,10 @@ static enum llc_mig can_migrate_llc_task(int src_cpu, int dst_cpu,
 		return mig_unrestricted;
 	}
 
-	if (cpus_share_cache(dst_cpu, cpu))
-		to_pref = true;
-	else if (cpus_share_cache(src_cpu, cpu))
-		to_pref = false;
-	else
-		return mig_unrestricted;
+	to_pref = if_to_prefer(src_cpu, dst_cpu, llc_id(cpu));
 
-	return can_migrate_llc(src_cpu, dst_cpu,
-			       task_util(p), to_pref);
+	return can_migrate_node(src_cpu, dst_cpu,
+			       p, to_pref);
 }
 
 /*
@@ -10311,25 +10330,23 @@ static enum llc_mig can_migrate_llc_task(int src_cpu, int dst_cpu,
 static inline bool
 alb_break_llc(struct lb_env *env)
 {
+	int pref_llc = -1;
+	bool to_pref = false;
+
 	if (!sched_cache_enabled())
 		return false;
 
 	if (cpus_share_cache(env->src_cpu, env->dst_cpu))
 		return false;
 	/*
-	 * All tasks prefer to stay on their current CPU.
-	 * Do not pull a task from its preferred CPU if:
-	 * 1. It is the only task running there; OR
-	 * 2. Migrating it away from its preferred LLC would violate
-	 *    the cache-aware scheduling policy.
+	 * We need the preferred LLC to decide whether we can perform migration.
+	 * Therefore, we need to obtain task_struct, which is only available
+	 * when there is a task running.
+	 * For cases with more than one task on the rq, we need to check
+	 * this in can_migrate_task().
 	 */
-	if (env->src_rq->nr_pref_llc_running &&
-	    env->src_rq->nr_pref_llc_running == env->src_rq->cfs.h_nr_runnable) {
-		unsigned long util = 0;
+	if (env->src_rq->nr_running == 1) {
 		struct task_struct *cur;
-
-		if (env->src_rq->nr_running <= 1)
-			return true;
 
 		/*
 		 * Reach here in load balance with
@@ -10337,10 +10354,12 @@ alb_break_llc(struct lb_env *env)
 		 */
 		cur = rcu_dereference(env->src_rq->curr);
 		if (cur)
-			util = task_util(cur);
+			pref_llc = cur->preferred_llc;
 
-		if (can_migrate_llc(env->src_cpu, env->dst_cpu,
-				    util, false) == mig_forbid)
+		to_pref = if_to_prefer(env->src_cpu, env->dst_cpu, pref_llc);
+
+		if (can_migrate_node(env->src_cpu, env->dst_cpu,
+				    cur, to_pref) == mig_forbid)
 			return true;
 	}
 
@@ -10370,15 +10389,6 @@ static bool migrate_degrades_llc(struct task_struct *p, struct lb_env *env)
 	 */
 	if (env->sd->nr_balance_failed >= env->sd->cache_nice_tries + 1)
 		return false;
-
-	/*
-	 * We know the env->src_cpu has some tasks prefer to
-	 * run on env->dst_cpu, skip the tasks do not prefer
-	 * env->dst_cpu, and find the one that prefers.
-	 */
-	if (env->migration_type == migrate_llc_task &&
-	    task_llc(p) != llc_id(env->dst_cpu))
-		return true;
 
 	if (can_migrate_llc_task(env->src_cpu,
 				 env->dst_cpu, p) != mig_forbid)
@@ -10498,15 +10508,14 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	 * 3) task is cache cold, or
 	 * 4) too many balance attempts have failed.
 	 */
-	if (env->flags & LBF_ACTIVE_LB)
-		return 1;
-
 	degrades = migrate_degrades_locality(p, env);
 	if (!degrades) {
 		/*
 		 * If the NUMA locality is not broken,
 		 * further check if migration would hurt
 		 * LLC locality.
+		 * This should be done before check LBF_ACTIVE_LB
+		 * as we has not check some cases in alb_break_llc
 		 */
 		if (migrate_degrades_llc(p, env))
 			return 0;
@@ -10515,6 +10524,9 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	} else {
 		hot = degrades > 0;
 	}
+
+	if (env->flags & LBF_ACTIVE_LB)
+		return 1;
 
 	if (!hot || env->sd->nr_balance_failed > env->sd->cache_nice_tries) {
 		if (hot)
