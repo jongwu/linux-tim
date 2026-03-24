@@ -566,6 +566,8 @@ static __init int sched_init_debug(void)
 #ifdef CONFIG_SCHED_CACHE
 	debugfs_create_file("llc_enabled", 0644, debugfs_sched, NULL,
 			    &sched_cache_enable_fops);
+	debugfs_create_u32("llc_override_numa_balance", 0644, debugfs_sched,
+			   &llc_override_numa_balance);
 	debugfs_create_u32("llc_aggr_tolerance", 0644, debugfs_sched,
 			   &llc_aggr_tolerance);
 	debugfs_create_u32("llc_epoch_period", 0644, debugfs_sched,

@@ -3925,6 +3925,7 @@ extern unsigned int llc_epoch_period;
 extern unsigned int llc_epoch_affinity_timeout;
 extern unsigned int llc_imb_pct;
 extern unsigned int llc_overaggr_pct;
+extern unsigned int llc_override_numa_balance;
 
 static inline bool sched_cache_enabled(void)
 {
