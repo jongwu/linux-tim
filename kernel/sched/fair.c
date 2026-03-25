@@ -1197,6 +1197,9 @@ __read_mostly unsigned int llc_epoch_period       = EPOCH_PERIOD;
 __read_mostly unsigned int llc_epoch_affinity_timeout = EPOCH_LLC_AFFINITY_TIMEOUT;
 __read_mostly unsigned int llc_imb_pct     = 20;
 __read_mostly unsigned int llc_overaggr_pct     = 50;
+__read_mostly unsigned int llc_scan_period_min = 1;
+__read_mostly unsigned int llc_scan_period_max = 64 * HZ;
+__read_mostly unsigned int llc_scan_period_threshold = HZ;
 
 bool sched_cache_inuse(void)
 {
@@ -1408,6 +1411,7 @@ void mm_init_sched(struct mm_struct *mm,
 	raw_spin_lock_init(&mm->sc_stat.lock);
 	mm->sc_stat.epoch = epoch;
 	mm->sc_stat.cpu = -1;
+	mm->sc_stat.scan_period = llc_scan_period_min;
 
 	/*
 	 * The update to mm->sc_stat should not be reordered
@@ -1534,13 +1538,8 @@ void account_mm_sched(struct rq *rq, struct task_struct *p, s64 delta_exec)
 		epoch = rq->cpu_epoch;
 	}
 
-	/*
-	 * If this process hasn't hit task_cache_work() for a while, or it
-	 * has only 1 thread, invalidate its preferred state.
-	 */
-	if (time_after(epoch,
-		       READ_ONCE(mm->sc_stat.epoch) + llc_epoch_affinity_timeout) ||
-	    get_nr_threads(p) <= 1 ||
+	/* If it has only 1 thread, invalidate its preferred state. */
+	if (get_nr_threads(p) <= 1 ||
 	    exceed_llc_nr(mm, cpu_of(rq), p) ||
 	    exceed_llc_capacity(mm, cpu_of(rq), p)) {
 		if (mm->sc_stat.cpu != -1)
@@ -1573,6 +1572,10 @@ static void task_tick_cache(struct rq *rq, struct task_struct *p)
 	epoch = rq->cpu_epoch;
 	/* avoid moving backwards */
 	if (time_after_eq(mm->sc_stat.epoch, epoch))
+		return;
+
+	if (time_before(jiffies, mm->sc_stat.next_scan) &&
+			!mm->sc_stat.need_scan)
 		return;
 
 	guard(raw_spinlock)(&mm->sc_stat.lock);
@@ -1608,7 +1611,8 @@ static void task_cache_work(struct callback_head *work)
 	unsigned long m_a_occ = 0;
 	unsigned long m_a_n_occ = 0;
 	unsigned long curr_m_a_n_occ = 0;
-	int cpu, m_a_cpu = -1, m_a_n_cpu = -1, nr_running = 0, curr_cpu;
+	unsigned long now;
+	int cpu, m_a_cpu = -1, m_a_n_cpu = -1, nr_running = 0, curr_cpu, need_scan = 0;
 	cpumask_var_t cpus;
 
 	WARN_ON_ONCE(work != &p->cache_work);
@@ -1629,6 +1633,12 @@ static void task_cache_work(struct callback_head *work)
 
 	if (!zalloc_cpumask_var(&cpus, GFP_KERNEL))
 		return;
+
+	now = jiffies;
+	if (time_before(now, READ_ONCE(mm->sc_stat.next_scan)))
+		return;
+
+	WRITE_ONCE(mm->sc_stat.next_scan, (now + mm->sc_stat.scan_period));
 
 	scoped_guard (cpus_read_lock) {
 		cpumask_copy(cpus, cpu_online_mask);
@@ -1698,7 +1708,8 @@ static void task_cache_work(struct callback_head *work)
 		}
 	}
 
-	if (m_a_n_occ > (2 * curr_m_a_n_occ)) {
+	need_scan = READ_ONCE(mm->sc_stat.need_scan);
+	if (m_a_n_occ > (2 * curr_m_a_n_occ) || need_scan) {
 		/*
 		 * Avoid switching sc_stat.cpu too fast.
 		 * The reason to choose 2X is because:
@@ -1709,8 +1720,34 @@ static void task_cache_work(struct callback_head *work)
 		 * 3. 2X is chosen based on test results, as it delivers
 		 *    the optimal performance gain so far.
 		 */
-		mm->sc_stat.cpu = m_a_n_cpu;
+		if (m_a_n_occ > (2 * curr_m_a_n_occ))
+			mm->sc_stat.cpu = m_a_n_cpu;
+
+		if (!mm->sc_stat.last_reset_tick)
+			mm->sc_stat.last_reset_tick = now;
+
+		/* Change scan_period when preferred NUMA changed */
+		if (((mm->sc_stat.cpu != -1) && (m_a_n_cpu != -1)
+			&& (cpu_to_node(mm->sc_stat.cpu) != cpu_to_node(m_a_n_cpu)))
+			|| need_scan) {
+			if (!need_scan)
+				need_scan = 1;
+
+			WRITE_ONCE(mm->sc_stat.scan_period,
+				max(mm->sc_stat.scan_period >> 1, llc_scan_period_min));
+			WRITE_ONCE(mm->sc_stat.last_reset_tick, now);
+		}
 	}
+
+	if ((now - READ_ONCE(mm->sc_stat.last_reset_tick) > llc_scan_period_threshold)
+			&& !need_scan) {
+		WRITE_ONCE(mm->sc_stat.scan_period, min(mm->sc_stat.scan_period << 1,
+			   llc_scan_period_max));
+		WRITE_ONCE(mm->sc_stat.last_reset_tick, now);
+	}
+
+	if (READ_ONCE(mm->sc_stat.need_scan))
+		WRITE_ONCE(mm->sc_stat.need_scan, 0);
 
 	update_avg_scale(&mm->sc_stat.nr_running_avg, nr_running);
 	free_cpumask_var(cpus);
@@ -10047,6 +10084,13 @@ static inline int task_is_ineligible_on_dst_cpu(struct task_struct *p, int dest_
 	((util) * 100 < (max) * llc_overaggr_pct)
 
 /*
+ * Like fits_llc_capacity but consider bias.
+ * The bias here is the half of llc_imb_pct.
+ */
+#define fits_llc_cap_imb(util, max)    \
+	((util) * 100 < (max) * (llc_overaggr_pct + llc_imb_pct / 2))
+
+/*
  * The margin used when comparing utilization.
  * is 'util1' noticeably greater than 'util2'
  * Derived from capacity_greater().
@@ -10227,6 +10271,7 @@ static bool is_domain_overload(struct sched_domain *sd)
  */
 static enum llc_mig can_migrate_node(int src_cpu, int dst_cpu, struct task_struct *p, bool to_pref)
 {
+	struct mm_struct *mm = NULL;
 	struct sched_domain *domain;
 	unsigned long dst_util, dst_cap, tsk_util = 0;
 	int k = 0;
@@ -10234,16 +10279,22 @@ static enum llc_mig can_migrate_node(int src_cpu, int dst_cpu, struct task_struc
 	if (!get_llc_stats(dst_cpu, &dst_util, &dst_cap))
 		return mig_unrestricted;
 
-	if (p)
+	if (p) {
+		mm = p->mm;
 		tsk_util = task_util(p);
+	}
 
 	dst_util = dst_util + tsk_util;
 
 	if (to_pref) {
 		if (fits_llc_capacity(dst_util, dst_cap))
 			return mig_llc;
-		else
+		else {
+			if (mm && !fits_llc_cap_imb(dst_util, dst_cap))
+				mm->sc_stat.need_scan = 1;
+
 			return mig_unrestricted;
+		}
 	}
 
 	/*
@@ -10263,8 +10314,12 @@ static enum llc_mig can_migrate_node(int src_cpu, int dst_cpu, struct task_struc
 		 * For the special case: the workload is small and the dest cpu may far away
 		 * from src cpu.
 		 */
-		if (p && (domain->span_weight > get_nr_threads(p) && k++))
+		if (p && (domain->span_weight > get_nr_threads(p) && k++)) {
+			if (mm && !fits_llc_cap_imb(dst_util, dst_cap))
+				mm->sc_stat.need_scan = 1;
+
 			return mig_unrestricted;
+		}
 
 		/* Don't migrate if there is a better place to live */
 		if (!is_domain_overload(domain))

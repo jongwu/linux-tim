@@ -568,6 +568,12 @@ static __init int sched_init_debug(void)
 			    &sched_cache_enable_fops);
 	debugfs_create_u32("llc_override_numa_balance", 0644, debugfs_sched,
 			   &llc_override_numa_balance);
+	debugfs_create_u32("llc_scan_period_max", 0644, debugfs_sched,
+			   &llc_scan_period_max);
+	debugfs_create_u32("llc_scan_period_min", 0644, debugfs_sched,
+			   &llc_scan_period_min);
+	debugfs_create_u32("llc_scan_period_threshold", 0644, debugfs_sched,
+			   &llc_scan_period_threshold);
 	debugfs_create_u32("llc_aggr_tolerance", 0644, debugfs_sched,
 			   &llc_aggr_tolerance);
 	debugfs_create_u32("llc_epoch_period", 0644, debugfs_sched,

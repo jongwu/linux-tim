@@ -2347,7 +2347,11 @@ struct sched_cache_stat {
 	struct sched_cache_time __percpu *pcpu_time;
 	raw_spinlock_t lock;
 	unsigned long epoch;
+	unsigned long last_reset_tick;
+	unsigned long next_scan;
+	unsigned long scan_period;
 	u64 nr_running_avg;
+	int need_scan;
 	int cpu;
 } ____cacheline_aligned_in_smp;
 
