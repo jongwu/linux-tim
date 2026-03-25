@@ -9941,6 +9941,11 @@ struct lb_env {
 	enum fbq_type		fbq_type;
 	enum migration_type	migration_type;
 	struct list_head	tasks;
+	int			local_idles;
+	int			busiest_idles;
+#ifdef CONFIG_SCHED_CACHE
+	int			llc_imbalance;
+#endif
 };
 
 /*
@@ -11732,8 +11737,10 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 			sgs->nr_preferred_running += rq->nr_preferred_running;
 		}
 #endif
-		if (local_group)
+		if (local_group) {
+			env->local_idles = sgs->idle_cpus;
 			continue;
+		}
 
 		if (sd_flags & SD_ASYM_CPUCAPACITY) {
 			/* Check for a misfit task on the cpu */
@@ -12398,6 +12405,14 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
 		update_sg_lb_stats(env, sds, sg, sgs, &sg_overloaded, &sg_overutilized);
 
 		if (!local_group && update_sd_pick_busiest(env, sds, sg, sgs)) {
+#ifdef CONFIG_SCHED_CACHE
+			if (!fits_llc_cap_imb(sgs->group_util, sgs->group_capacity)
+				&& util_greater(sgs->group_util, local->group_util)) {
+				env->busiest_idles = sgs->idle_cpus;
+				env->llc_imbalance = 1;
+			} else
+				env->llc_imbalance = 0;
+#endif
 			sds->busiest = sg;
 			sds->busiest_stat = *sgs;
 		}
@@ -12788,6 +12803,68 @@ out_balanced:
 	return NULL;
 }
 
+#ifdef CONFIG_SCHED_CACHE
+
+/*
+ * Here, the best task refers to the thread group with the highest
+ * hit count in this sched group.
+ * The second best task is the one with the second highest hit count.
+ *
+ * This second best task mechanism is introduced to mitigate
+ * load imbalance caused by cache-aware scheduling.
+ */
+static struct task_struct *
+find_second_best_task(struct lb_env *env, struct sched_group *group, int *second_best_score)
+{
+	struct task_struct *best_task = NULL, *second_best_task = NULL;
+	int best_task_score = 0, i;
+	int *pref_task = NULL, wt = 0;
+
+	if (!sched_cache_enabled() || !group || !second_best_score)
+		return NULL;
+
+	/* only allow NUMA domain to do this */
+	if (!env->sd->child || env->sd->child->flags & SD_SHARE_LLC)
+		return NULL;
+
+	wt = cpumask_weight(sched_group_span(group));
+	pref_task = kmalloc_array(wt, sizeof(int), GFP_NOWAIT);
+
+	if (!pref_task)
+		return NULL;
+
+	memset(pref_task, 0, sizeof(int) * wt);
+	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
+		struct rq *rq = cpu_rq(i);
+		struct task_struct *curr = rq->curr;
+		unsigned int tgid = 0, idx = 0;
+
+		if (curr && curr->mm && curr->preferred_llc != -1) {
+			tgid = curr->tgid;
+			idx = tgid % wt;
+			if (cpumask_test_cpu(curr->mm->sc_stat.cpu,
+				sched_group_span(group))) {
+				pref_task[idx]++;
+				if (best_task_score < pref_task[idx]) {
+					if (!best_task) {
+						best_task = curr;
+						best_task_score = pref_task[idx];
+					} else if (best_task->tgid != tgid) {
+						*second_best_score = best_task_score;
+						best_task_score = pref_task[idx];
+						second_best_task = best_task;
+						best_task = curr;
+					}
+				}
+			}
+		}
+	}
+
+	kfree(pref_task);
+	return second_best_task;
+}
+#endif
+
 /*
  * sched_balance_find_src_rq - find the busiest runqueue among the CPUs in the group.
  */
@@ -12797,12 +12874,22 @@ static struct rq *sched_balance_find_src_rq(struct lb_env *env,
 	struct rq *busiest = NULL, *rq;
 	unsigned long busiest_util = 0, busiest_load = 0, busiest_capacity = 1;
 	unsigned int busiest_nr = 0;
+	int i;
 #ifdef CONFIG_SCHED_CACHE
 	unsigned int busiest_pref_llc = 0;
+	struct task_struct *second_best_task = NULL;
 	struct sched_domain *sd_tmp;
-	int dst_llc;
+	int dst_llc, second_best_score = env->local_idles;
+
+	if (sched_cache_enabled() && env->llc_imbalance) {
+		second_best_task = find_second_best_task(env, group, &second_best_score);
+		if (second_best_task &&
+			env->migration_type == migrate_task &&
+			(env->local_idles - env->busiest_idles) >> 1 > second_best_score &&
+			env->local_idles - env->busiest_idles > get_nr_threads(second_best_task))
+			env->migration_type = migrate_llc_task;
+	}
 #endif
-	int i;
 
 	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
 		unsigned long capacity, load, util;
@@ -12931,6 +13018,10 @@ static struct rq *sched_balance_find_src_rq(struct lb_env *env,
 
 		case migrate_llc_task:
 #ifdef CONFIG_SCHED_CACHE
+			if (second_best_task && second_best_task->tgid == rq->curr->tgid) {
+				busiest = rq;
+				break;
+			}
 			sd_tmp = rcu_dereference(rq->sd);
 			dst_llc = llc_id(env->dst_cpu);
 			if (valid_llc_buf(sd_tmp, dst_llc)) {
@@ -13155,6 +13246,7 @@ static int sched_balance_rq(int this_cpu, struct rq *this_rq,
 		.cpus		= cpus,
 		.fbq_type	= all,
 		.tasks		= LIST_HEAD_INIT(env.tasks),
+		.llc_imbalance	= 0,
 	};
 	bool need_unlock = false;
 
