@@ -11487,6 +11487,83 @@ static bool update_llc_busiest(struct lb_env *env,
 	 */
 	return sgs->nr_pref_dst_llc > busiest->nr_pref_dst_llc;
 }
+
+/*
+ * Get all LLCs that are closer to the destination LLC than to the
+ * source LLC.
+ * @affi_llcs: array to store LLCs satisfying the above condition
+ * @dist: array to store Di for each LLC in affi_llcs, computed as:
+ *
+ * Di = llc_distance(src_llc, LLCi) - llc_distance(dst_llc, LLCi)   (1)
+ * where i is the index of affi_llcs.
+ */
+static int get_affi_llcs(int src_llc, int dst_llc, int *affi_llcs, int *dist)
+{
+	int j = 0, dis1, dis2;
+
+	if (src_llc == dst_llc)
+		return 0;
+
+	if (llc_to_node(src_llc) == llc_to_node(dst_llc)) {
+		affi_llcs[j] = dst_llc;
+		dist[j++] = 2;
+		return j;
+	}
+
+	for (int i = 0; i < max_llcs; i++) {
+		dis1 = llc_distance(src_llc, i);
+		dis2 = llc_distance(dst_llc, i);
+		if (dis1 < 0 || dis2 < 0)
+			continue;
+		if (dis1 > dis2) {
+			dist[j] = clamp(dis1 - dis2, 4, 1024);
+			affi_llcs[j++] = i;
+		}
+	}
+
+	return j;
+}
+
+/*
+ * To find a src sched group/rq during load balancing, we need a method to
+ * calculate the benefit of each rq. For sched cache, we focus more  on
+ * affinity improvement.
+ *
+ * This provides a way to quantify the affinity improvement for each rq
+ * by assigning an affinity score to each rq.
+ *
+ * Calculate the affinity score for a rq given src llc and dst llc.
+ * It is computed as:
+ * Di = llc_distance(src_llc, LLCi) - llc_distance(dst_llc, LLCi)   (1)
+ * W_i = Rt_i * 1024 / Di              (2)
+ * p = Σ_i W_i                         (3)
+ *
+ * where i is the index of an LLC, Di is obtained from get_affi_llcs, and
+ * Rt_i is the number of tasks on the rq with LLCi as their preferred LLC,
+ * obtainable from rq->sd->pf.
+ */
+static int cal_affinity_score(struct rq *rq, int src_cpu, int dst_llc)
+{
+	int *affi_llcs, *dist, num, wt = 0;
+	struct sched_domain *sd_tmp = rcu_dereference(rq->sd);
+
+	affi_llcs = kmalloc_array(max_llcs, sizeof(*affi_llcs), GFP_NOWAIT);
+	if (!affi_llcs)
+		return wt;
+
+	dist = kmalloc_array(max_llcs, sizeof(*dist), GFP_NOWAIT);
+	if (!dist)
+		goto fail;
+
+	num = get_affi_llcs(llc_id(src_cpu), dst_llc, affi_llcs, dist);
+	for (int i = 0; i < num; i++)
+		wt += (sd_tmp->pf[affi_llcs[i]] << 10) / dist[i];
+
+	kfree(dist);
+fail:
+	kfree(affi_llcs);
+	return wt;
+}
 #else
 static inline void record_sg_llc_stats(struct lb_env *env, struct sg_lb_stats *sgs,
 				       struct sched_group *group)
