@@ -11471,8 +11471,8 @@ static inline bool llc_balance(struct lb_env *env, struct sg_lb_stats *sgs,
 		return false;
 
 	if (sgs->nr_pref_dst_llc &&
-	    can_migrate_llc(cpumask_first(sched_group_span(group)),
-			    env->dst_cpu, 0, true) == mig_llc)
+	    can_migrate_node(cpumask_first(sched_group_span(group)),
+			    env->dst_cpu, NULL, true) == mig_llc)
 		return true;
 
 	return false;
@@ -11630,7 +11630,7 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 			struct sched_domain *sd_tmp = rcu_dereference(rq->sd);
 
 			if (valid_llc_buf(sd_tmp, dst_llc))
-				sgs->nr_pref_dst_llc += sd_tmp->pf[dst_llc];
+				sgs->nr_pref_dst_llc += cal_affinity_score(rq, i, dst_llc);
 		}
 #endif
 
@@ -12856,7 +12856,7 @@ static struct rq *sched_balance_find_src_rq(struct lb_env *env,
 			sd_tmp = rcu_dereference(rq->sd);
 			dst_llc = llc_id(env->dst_cpu);
 			if (valid_llc_buf(sd_tmp, dst_llc)) {
-				unsigned int this_pref_llc = sd_tmp->pf[dst_llc];
+				unsigned int this_pref_llc = cal_affinity_score(rq, i, dst_llc);
 
 				if (busiest_pref_llc < this_pref_llc) {
 					busiest_pref_llc = this_pref_llc;
